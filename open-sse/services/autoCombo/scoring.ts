@@ -21,6 +21,8 @@ export interface ScoringFactors {
   contextAffinity: number;
   resetWindowAffinity: number;
   connectionDensity: number;
+  capacity: number;
+  runtimePressure: number;
 }
 
 export interface ScoringWeights {
@@ -36,6 +38,8 @@ export interface ScoringWeights {
   contextAffinity: number;
   resetWindowAffinity: number;
   connectionDensity: number;
+  capacity: number;
+  runtimePressure: number;
 }
 
 export const DEFAULT_WEIGHTS: ScoringWeights = {
@@ -45,12 +49,14 @@ export const DEFAULT_WEIGHTS: ScoringWeights = {
   latencyInv: 0.12,
   taskFit: 0.08,
   stability: 0.05,
-  tierPriority: 0.05,
+  tierPriority: 0,
   tierAffinity: 0.05,
   specificityMatch: 0.05,
   contextAffinity: 0.05,
   resetWindowAffinity: 0,
-  connectionDensity: 0.05,
+  connectionDensity: 0,
+  capacity: 0.05,
+  runtimePressure: 0.05,
 };
 
 export interface ProviderCandidate {
@@ -81,6 +87,23 @@ export interface ProviderCandidate {
   resetWindowAffinity?: number;
   connectionPoolSize?: number;
   connectionId?: string;
+
+  /** Documented provider free-tier capacity from the provider-intelligence snapshot. */
+  documentedCapacity?: boolean;
+  documentedRequestsPerMinute?: number | null;
+  documentedRequestsPerHour?: number | null;
+  documentedRequestsPerDay?: number | null;
+  documentedTokensPerMinute?: number | null;
+  documentedTokensPerDay?: number | null;
+  documentedConcurrency?: number | null;
+  /** Live runtime saturation from quota/header telemetry, 0..1. */
+  runtimeSaturation?: number;
+  /** Live runtime pressure derived from saturation/health, 0..1. */
+  runtimePressure?: number;
+  /** Reset timestamp associated with live runtime saturation, when known. */
+  runtimeResetAt?: number | null;
+  /** Source of the live runtime signal. */
+  runtimePressureSource?: "header" | "quota" | "usage" | "health" | "none";
 }
 
 export interface ScoredProvider {
@@ -111,7 +134,9 @@ export function calculateScore(factors: ScoringFactors, weights: ScoringWeights)
       (weights.specificityMatch ?? 0) * factors.specificityMatch +
       (weights.contextAffinity ?? 0) * factors.contextAffinity +
       (weights.resetWindowAffinity ?? 0) * factors.resetWindowAffinity +
-      (weights.connectionDensity ?? 0) * factors.connectionDensity
+      (weights.connectionDensity ?? 0) * factors.connectionDensity +
+      (weights.capacity ?? 0) * factors.capacity +
+      (weights.runtimePressure ?? 0) * factors.runtimePressure
   );
 }
 
@@ -157,6 +182,82 @@ function calculateTierAffinity(
   }
 }
 
+type CapacityMetric =
+  | "documentedTokensPerDay"
+  | "documentedRequestsPerDay"
+  | "documentedRequestsPerHour"
+  | "documentedRequestsPerMinute"
+  | "documentedConcurrency";
+
+const CAPACITY_METRICS: readonly CapacityMetric[] = [
+  "documentedTokensPerDay",
+  "documentedRequestsPerDay",
+  "documentedRequestsPerHour",
+  "documentedRequestsPerMinute",
+  "documentedConcurrency",
+];
+
+function positiveCapacityValue(
+  candidate: ProviderCandidate,
+  metric: CapacityMetric
+): number | null {
+  const value = candidate[metric];
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : null;
+}
+
+function chooseCapacityMetric(pool: ProviderCandidate[]): CapacityMetric | null {
+  let bestMetric: CapacityMetric | null = null;
+  let bestCoverage = 0;
+
+  for (const metric of CAPACITY_METRICS) {
+    const coverage = pool.filter(
+      (candidate) => positiveCapacityValue(candidate, metric) !== null
+    ).length;
+
+    if (coverage > bestCoverage) {
+      bestCoverage = coverage;
+      bestMetric = metric;
+    }
+  }
+
+  return bestMetric;
+}
+
+/**
+ * Capacity is intentionally conservative:
+ * - undocumented providers are neutral (0.50)
+ * - documented providers without a numeric capacity receive a small evidence bonus (0.55)
+ * - documented numeric capacity is normalized pool-relatively on a log scale
+ *
+ * We choose one dominant dimension for the pool rather than comparing
+ * fundamentally different units (tokens/day vs requests/day) directly.
+ */
+export function calculateCapacityScore(
+  candidate: ProviderCandidate,
+  pool: ProviderCandidate[]
+): number {
+  if (!candidate.documentedCapacity) return 0.5;
+
+  const metric = chooseCapacityMetric(pool);
+  if (!metric) return 0.55;
+
+  const value = positiveCapacityValue(candidate, metric);
+  if (value === null) return 0.55;
+
+  let maxValue = 0;
+  for (const item of pool) {
+    const itemValue = positiveCapacityValue(item, metric);
+    if (itemValue !== null) {
+      maxValue = Math.max(maxValue, itemValue);
+    }
+  }
+
+  if (!(maxValue > 0)) return 0.55;
+
+  const normalized = clamp01(Math.log1p(value) / Math.log1p(maxValue));
+  return clamp01(0.55 + normalized * 0.45);
+}
+
 function calculateSpecificityMatch(
   candidate: ProviderCandidate,
   hint: RoutingHint | undefined | null
@@ -174,6 +275,23 @@ function calculateSpecificityMatch(
   } catch {
     return 0.5;
   }
+}
+
+/**
+ * Convert live runtime saturation into a routing score.
+ *
+ * Missing telemetry is deliberately neutral. Higher saturation lowers the
+ * factor because the provider is under greater runtime pressure.
+ */
+export function calculateRuntimePressureScore(candidate: ProviderCandidate): number {
+  const saturation = clamp01(candidate.runtimeSaturation ?? 0);
+  const explicitPressure = candidate.runtimePressure;
+
+  if (typeof explicitPressure === "number" && Number.isFinite(explicitPressure)) {
+    return clamp01(1 - explicitPressure);
+  }
+
+  return clamp01(1 - saturation);
 }
 
 export function calculateFactors(
@@ -209,6 +327,8 @@ export function calculateFactors(
     contextAffinity: clamp01(candidate.contextAffinity ?? 0.5),
     resetWindowAffinity: clamp01(candidate.resetWindowAffinity ?? 0.5),
     connectionDensity: clamp01(((candidate.connectionPoolSize ?? 1) - 1) / 10),
+    capacity: calculateCapacityScore(candidate, pool),
+    runtimePressure: calculateRuntimePressureScore(candidate),
   };
 }
 

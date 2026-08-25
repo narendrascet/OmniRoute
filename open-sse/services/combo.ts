@@ -69,6 +69,7 @@ import { resolveAutoStrategyOrder } from "./combo/resolveAutoStrategy.ts";
 import { applyStrategyOrdering } from "./combo/applyStrategyOrdering.ts";
 import { handlePipelineCombo, buildPipelineResponse } from "./autoCombo/pipelineRouter.ts";
 import { type ProviderCandidate } from "./autoCombo/scoring.ts";
+import { getProviderCapacity } from "./providerCapacity.ts";
 import { estimateTokens } from "./contextManager.ts";
 import { getSessionConnection } from "./sessionManager.ts";
 import {
@@ -360,6 +361,7 @@ export async function buildAutoCandidates(
   const quotaCutoffEnabled =
     (resilienceSettings ?? resolveResilienceSettings(null))?.quotaPreflight?.enabled === true;
   const { getPricingForModel } = await import("../../src/lib/localDb");
+  const { getSaturation } = await import("../../src/lib/quota/saturationSignals");
   const quotaPromises = new Map<string, Promise<unknown>>();
   let historicalLatencyStats: Record<string, HistoricalLatencyStatsEntry> = {};
   try {
@@ -384,7 +386,10 @@ export async function buildAutoCandidates(
   await Promise.all(
     uniqueProviders.map(async (provider) => {
       try {
-        const connections = (await getCachedProviderConnections({ provider, isActive: true })) as Array<Record<string, unknown>>;
+        const connections = (await getCachedProviderConnections({
+          provider,
+          isActive: true,
+        })) as Array<Record<string, unknown>>;
         const active = Array.isArray(connections) ? connections : [];
         connectionPoolCounts.set(provider, active.length);
         connectionsByProvider.set(provider, active);
@@ -521,6 +526,21 @@ export async function buildAutoCandidates(
       let quotaCutoffReason: string | undefined;
       const fetcher = getQuotaFetcher(provider);
       const connection = target.connectionId ? connectionById.get(target.connectionId) : undefined;
+      const providerCapacity = getProviderCapacity(provider);
+
+      // Live runtime saturation from the existing quota/header telemetry path.
+      // The saturation engine is cached and fail-open, so this must never make
+      // candidate construction fail.
+      let runtimeSaturation = 0;
+      if (target.connectionId) {
+        runtimeSaturation = await getSaturation(
+          target.connectionId,
+          provider,
+          { unit: "percent", window: "5h" },
+          connection
+        ).catch(() => 0);
+      }
+      runtimeSaturation = Math.max(0, Math.min(1, runtimeSaturation));
       // Gate the terminal-status cutoff behind the same opt-in as the quota-percent
       // cutoff (#4483): when quota cutoff is disabled, a connection in a terminal
       // testStatus must still fall through to normal connection-cooldown / model-lockout
@@ -602,6 +622,17 @@ export async function buildAutoCandidates(
         statusPenaltyReason,
         connectionPoolSize: connectionPoolCounts.get(provider) ?? 1,
         connectionId: target.connectionId ?? undefined,
+        documentedCapacity: providerCapacity.documented,
+        documentedRequestsPerMinute: providerCapacity.requestsPerMinute,
+        documentedRequestsPerHour: providerCapacity.requestsPerHour,
+        documentedRequestsPerDay: providerCapacity.requestsPerDay,
+        documentedTokensPerMinute: providerCapacity.tokensPerMinute,
+        documentedTokensPerDay: providerCapacity.tokensPerDay,
+        documentedConcurrency: providerCapacity.concurrency,
+        runtimeSaturation,
+        runtimePressure: 1 - runtimeSaturation,
+        runtimeResetAt: null,
+        runtimePressureSource: (target.connectionId ? "quota" : "none") as const,
       };
     })
   );
