@@ -632,7 +632,7 @@ export async function buildAutoCandidates(
         runtimeSaturation,
         runtimePressure: 1 - runtimeSaturation,
         runtimeResetAt: null,
-        runtimePressureSource: (target.connectionId ? "quota" : "none") as const,
+        runtimePressureSource: target.connectionId ? ("quota" as const) : ("none" as const),
       };
     })
   );
